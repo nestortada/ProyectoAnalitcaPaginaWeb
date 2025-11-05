@@ -2,9 +2,10 @@
 
 import dynamic from 'next/dynamic'
 import React from 'react'
+import type { PlotParams } from 'react-plotly.js'
 
 // Cargamos react-plotly.js sólo en cliente para evitar errores de SSR
-const Plot = dynamic(() => import('react-plotly.js'), { ssr: false })
+const Plot = dynamic<PlotParams>(() => import('react-plotly.js'), { ssr: false })
 
 interface ChartProps {
   labels: (number | string)[]
