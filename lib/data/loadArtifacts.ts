@@ -33,6 +33,18 @@ export interface ClusterScaling {
   centroids: Record<string, number[]>
 }
 
+export interface DfSummary {
+  cultivos: string[]
+  cultivo_ciclos: Record<string, number | null>
+  municipios: Record<
+    string,
+    {
+      cultivos: string[]
+      defaults: Record<string, number | null>
+    }
+  >
+}
+
 async function fetchJSON<T>(url: string): Promise<T> {
   const res = await fetch(url)
   if (!res.ok) {
@@ -59,4 +71,8 @@ export async function loadClusterInfo(): Promise<ClusterInfo> {
 
 export async function loadClusterScaling(): Promise<ClusterScaling> {
   return fetchJSON<ClusterScaling>('/data/cluster_scaling_centroids.json')
+}
+
+export async function loadDfSummary(): Promise<DfSummary> {
+  return fetchJSON<DfSummary>('/data/df_final_summary.json')
 }

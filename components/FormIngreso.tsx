@@ -1,21 +1,48 @@
 "use client"
 
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   loadNumericPreprocessor,
   loadCategoricalPreprocessor,
   loadLinearModel,
   loadClusterInfo,
+  loadDfSummary,
   NumericPreprocessor,
   CategoricalPreprocessor,
   LinearRegressionModel,
   ClusterInfo,
+  DfSummary,
 } from '../lib/data/loadArtifacts'
 import { applyPipeline } from '../lib/inference/pipeline'
 import { predictLinear } from '../lib/inference/lr_predict'
 import { getClusterForMunicipio, getRecommendedCrops } from '../lib/inference/cluster'
 import { useStore } from '../lib/state/useStore'
+
+const EXCLUDED_FIELDS = new Set(['Año', 'Periodo', 'Área cosechada'])
+
+const AUTO_FIELDS = [
+  'Ph_avg',
+  'Capacidad de intercambio catiónico_avg',
+  'Monóxido de Carbono_avg',
+  'Porcentaje de acidez intercambiable_avg',
+  'La saturación de aluminio del suelo_avg',
+  'temperatura_avg',
+  'precipitacion_avg',
+]
+
+const FIELD_LABELS: Record<string, string> = {
+  'Área sembrada': 'Área sembrada (hectáreas)',
+  'Ciclo del cultivo': 'Ciclo del cultivo (días)',
+  Ph_avg: 'pH promedio del suelo',
+  'Capacidad de intercambio catiónico_avg':
+    'Capacidad de intercambio catiónico promedio (cmol(+)/kg)',
+  'Monóxido de Carbono_avg': 'Monóxido de carbono promedio (ppm)',
+  'Porcentaje de acidez intercambiable_avg': 'Acidez intercambiable promedio (%)',
+  'La saturación de aluminio del suelo_avg': 'Saturación de aluminio en el suelo (%)',
+  temperatura_avg: 'Temperatura promedio (°C)',
+  precipitacion_avg: 'Precipitación promedio (mm)',
+}
 
 /**
  * Formulario principal de ingreso de datos.
@@ -31,7 +58,7 @@ export default function FormIngreso() {
   const [model, setModel] = useState<LinearRegressionModel | null>(null)
   const [clusterInfo, setClusterInfo] = useState<ClusterInfo | null>(null)
   const [municipios, setMunicipios] = useState<string[]>([])
-  const [cultivosList, setCultivosList] = useState<string[]>([])
+  const [dfSummary, setDfSummary] = useState<DfSummary | null>(null)
 
   // Form state
   const [municipio, setMunicipio] = useState('')
@@ -44,22 +71,21 @@ export default function FormIngreso() {
   useEffect(() => {
     async function init() {
       try {
-        const [np, cp, lm, ci] = await Promise.all([
+        const [np, cp, lm, ci, summary] = await Promise.all([
           loadNumericPreprocessor(),
           loadCategoricalPreprocessor(),
           loadLinearModel(),
           loadClusterInfo(),
+          loadDfSummary(),
         ])
         setNumPre(np)
         setCatPre(cp)
         setModel(lm)
         setClusterInfo(ci)
+        setDfSummary(summary)
         // Municipios disponibles
         const muniList = Object.keys(ci.municipio_cluster).sort()
         setMunicipios(muniList)
-        // Lista de cultivos a partir de las categorías del OneHotEncoder
-        const cultivos = cp.categories['Cultivo'] || []
-        setCultivosList(cultivos)
         // Inicializar valores numéricos como vacíos
         const initial: Record<string, number | undefined> = {}
         np.features.forEach((f) => {
@@ -80,10 +106,57 @@ export default function FormIngreso() {
     setNumericValues((prev) => ({ ...prev, [key]: value === '' ? undefined : parseFloat(value) }))
   }
 
-  function handleInteresChange(e: React.ChangeEvent<HTMLSelectElement>) {
-    const selected = Array.from(e.target.selectedOptions).map((o) => o.value)
-    setIntereses(selected)
+  function toggleInteres(cultivo: string) {
+    setIntereses((prev) => {
+      if (prev.includes(cultivo)) {
+        return prev.filter((item) => item !== cultivo)
+      }
+      return [...prev, cultivo]
+    })
   }
+
+  const availableCultivos = useMemo(() => {
+    if (!dfSummary) return []
+    const muniEntry = municipio ? dfSummary.municipios[municipio] : undefined
+    const list = muniEntry?.cultivos?.length ? muniEntry.cultivos : dfSummary.cultivos
+    return list
+  }, [dfSummary, municipio])
+
+  useEffect(() => {
+    if (!availableCultivos.length) {
+      setIntereses((prev) => (prev.length ? [] : prev))
+      return
+    }
+    const allowed = new Set(availableCultivos)
+    setIntereses((prev) => prev.filter((cultivo) => allowed.has(cultivo)))
+  }, [availableCultivos])
+
+  useEffect(() => {
+    if (!dfSummary || !municipio) return
+    const muniEntry = dfSummary.municipios[municipio]
+    if (!muniEntry) return
+    setNumericValues((prev) => {
+      const next = { ...prev }
+      AUTO_FIELDS.forEach((field) => {
+        const raw = muniEntry.defaults[field]
+        next[field] = typeof raw === 'number' && !Number.isNaN(raw) ? raw : undefined
+      })
+      return next
+    })
+  }, [dfSummary, municipio])
+
+  useEffect(() => {
+    if (!dfSummary) return
+    const firstCultivo = intereses[0]
+    const ciclo = firstCultivo ? dfSummary.cultivo_ciclos[firstCultivo] : undefined
+    setNumericValues((prev) => {
+      const nextValue = typeof ciclo === 'number' && !Number.isNaN(ciclo) ? ciclo : undefined
+      if (prev['Ciclo del cultivo'] === nextValue) {
+        return prev
+      }
+      return { ...prev, 'Ciclo del cultivo': nextValue }
+    })
+  }, [dfSummary, intereses])
 
   async function handleSubmit() {
     if (!numPre || !catPre || !model || !clusterInfo) return
@@ -172,37 +245,60 @@ export default function FormIngreso() {
         <label className="block text-sm font-medium mb-1" htmlFor="interes">
           Cultivos de interés (opcional)
         </label>
-        <select
-          id="interes"
-          multiple
-          className="w-full border rounded-md p-2 h-32"
-          value={intereses}
-          onChange={handleInteresChange}
-        >
-          {cultivosList.map((c) => (
-            <option key={c} value={c}>
-              {c}
-            </option>
-          ))}
-        </select>
+        <div className="max-h-56 overflow-y-auto border rounded-md p-3 space-y-2">
+          {availableCultivos.length === 0 ? (
+            <p className="text-sm text-gray-500 dark:text-gray-400">
+              No se encontraron cultivos asociados al municipio seleccionado.
+            </p>
+          ) : (
+            availableCultivos.map((cultivo) => {
+              const id = `cultivo-${cultivo}`
+              return (
+                <label key={cultivo} className="flex items-start gap-2 text-sm" htmlFor={id}>
+                  <input
+                    id={id}
+                    type="checkbox"
+                    className="mt-1"
+                    checked={intereses.includes(cultivo)}
+                    onChange={() => toggleInteres(cultivo)}
+                  />
+                  <span>{cultivo}</span>
+                </label>
+              )
+            })
+          )}
+        </div>
+        {intereses.length > 1 && (
+          <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
+            Se utilizará el primer cultivo seleccionado para estimar el ciclo y ejecutar la proyección.
+          </p>
+        )}
       </div>
       {/* Variables numéricas */}
       <fieldset className="border rounded-md p-4">
         <legend className="text-sm font-semibold">Variables agronómicas y climáticas</legend>
-        {numPre.features.map((feature) => (
-          <div key={feature} className="mt-3">
-            <label className="block text-xs font-medium" htmlFor={feature}>
-              {feature}
-            </label>
-            <input
-              id={feature}
-              type="number"
-              className="w-full border rounded-md p-2"
-              value={numericValues[feature] ?? ''}
-              onChange={(e) => handleNumericChange(feature, e.target.value)}
-            />
-          </div>
-        ))}
+        {numPre.features
+          .filter((feature) => !EXCLUDED_FIELDS.has(feature))
+          .map((feature) => {
+            const isReadOnly = feature === 'Ciclo del cultivo'
+            return (
+              <div key={feature} className="mt-3">
+                <label className="block text-xs font-medium" htmlFor={feature}>
+                  {FIELD_LABELS[feature] ?? feature}
+                </label>
+                <input
+                  id={feature}
+                  type="number"
+                  className="w-full border rounded-md p-2"
+                  value={numericValues[feature] ?? ''}
+                  onChange={
+                    isReadOnly ? undefined : (e) => handleNumericChange(feature, e.target.value)
+                  }
+                  readOnly={isReadOnly}
+                />
+              </div>
+            )
+          })}
       </fieldset>
       {/* Escenario de años y crecimiento */}
       <fieldset className="border rounded-md p-4">
