@@ -19,7 +19,7 @@ import { predictLinear } from '../lib/inference/lr_predict'
 import { getClusterForMunicipio, getRecommendedCrops } from '../lib/inference/cluster'
 import { useStore } from '../lib/state/useStore'
 
-const EXCLUDED_FIELDS = new Set(['Año', 'Periodo', 'Área cosechada', 'Ciclo del cultivo'])
+const EXCLUDED_FIELDS = new Set(['Año', 'Periodo', 'Área cosechada'])
 
 const AUTO_FIELDS = [
   'Ph_avg',
@@ -145,6 +145,19 @@ export default function FormIngreso() {
     })
   }, [dfSummary, municipio])
 
+  useEffect(() => {
+    if (!dfSummary) return
+    const firstCultivo = intereses[0]
+    const ciclo = firstCultivo ? dfSummary.cultivo_ciclos[firstCultivo] : undefined
+    setNumericValues((prev) => {
+      const nextValue = typeof ciclo === 'number' && !Number.isNaN(ciclo) ? ciclo : undefined
+      if (prev['Ciclo del cultivo'] === nextValue) {
+        return prev
+      }
+      return { ...prev, 'Ciclo del cultivo': nextValue }
+    })
+  }, [dfSummary, intereses])
+
   async function handleSubmit() {
     if (!numPre || !catPre || !model || !clusterInfo) return
     // Construir inputs categóricos
@@ -257,7 +270,7 @@ export default function FormIngreso() {
         </div>
         {intereses.length > 1 && (
           <p className="mt-2 text-xs text-gray-500 dark:text-gray-400">
-            Se utilizará el primer cultivo seleccionado para alimentar la proyección del modelo.
+            Se utilizará el primer cultivo seleccionado para estimar el ciclo y ejecutar la proyección.
           </p>
         )}
       </div>
@@ -267,6 +280,7 @@ export default function FormIngreso() {
         {numPre.features
           .filter((feature) => !EXCLUDED_FIELDS.has(feature))
           .map((feature) => {
+            const isReadOnly = feature === 'Ciclo del cultivo'
             return (
               <div key={feature} className="mt-3">
                 <label className="block text-xs font-medium" htmlFor={feature}>
@@ -277,7 +291,10 @@ export default function FormIngreso() {
                   type="number"
                   className="w-full border rounded-md p-2"
                   value={numericValues[feature] ?? ''}
-                  onChange={(e) => handleNumericChange(feature, e.target.value)}
+                  onChange={
+                    isReadOnly ? undefined : (e) => handleNumericChange(feature, e.target.value)
+                  }
+                  readOnly={isReadOnly}
                 />
               </div>
             )
