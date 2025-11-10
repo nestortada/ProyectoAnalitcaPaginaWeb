@@ -1,5 +1,7 @@
-import datetime
-import json
+"""Aplicación Streamlit para recomendar cultivos por municipio."""
+from __future__ import annotations
+
+import math
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -11,410 +13,747 @@ import streamlit as st
 try:
     import joblib  # type: ignore
 except ImportError:  # pragma: no cover
-    joblib = None
-import pickle
+    joblib = None  # type: ignore
+
+try:  # Importaciones opcionales utilizadas en los respaldos
+    from sklearn.cluster import KMeans
+    from sklearn.preprocessing import StandardScaler
+except Exception:  # pragma: no cover - se notificará en la UI cuando falten dependencias
+    KMeans = None  # type: ignore
+    StandardScaler = None  # type: ignore
+
+DATA_PATH = Path("df_final.csv")
+SCALER_MUNICIPIO_PATH = Path("scaler_municipio.joblib")
+KMEANS_MUNICIPIO_PATH = Path("kmeans_municipio.joblib")
+SCALER_MODELO_PATH = Path("scaler_modelo.joblib")
+MODELO_RENDIMIENTO_PATH = Path("modelo_rendimiento.joblib")
+FEATURE_COLS_PATH = Path("feature_cols.joblib")
+
+EXCLUDED_FEATURES = {"Año", "Periodo", "Area_cosechada"}
+DIV_PENALTY_FACTOR = 0.05
+RANDOM_STATE = 42
 
 
-def load_data(path: Path = Path("df_final.csv")) -> pd.DataFrame:
-    """Load the historical dataset if available and clean key columns."""
+def _standardize_string(value: object) -> str:
+    return str(value).strip().title()
+
+
+@st.cache_data(show_spinner=False)
+def load_data(path: Path = DATA_PATH) -> pd.DataFrame:
+    """Carga y limpia el dataset maestro."""
     if not path.exists():
         st.warning(
-            "No se encontró 'df_final.csv'. La aplicación funcionará en modo demostrativo"
-            " sin datos hasta que cargues el archivo requerido."
+            "No se encontró 'df_final.csv'. Coloca el archivo en la misma carpeta que"
+            " este script para habilitar todas las funciones."
         )
         return pd.DataFrame()
 
     try:
         df = pd.read_csv(path, encoding="utf-8")
-    except Exception as exc:  # pragma: no cover - feedback to UI
+    except Exception as exc:  # pragma: no cover - la excepción se comunica en UI
         st.error(f"No se pudo leer 'df_final.csv': {exc}")
         return pd.DataFrame()
 
+    # Normalización básica de nombres de columnas
+    df.columns = [col.strip() for col in df.columns]
+    rename_map = {
+        "municipio": "Municipio",
+        "cultivo": "Cultivo",
+        "produccion_t_ha": "Produccion_t_ha",
+        "produccion_tons_ha": "Produccion_t_ha",
+        "produccion_ton_ha": "Produccion_t_ha",
+        "produccion_toneladas_ha": "Produccion_t_ha",
+        "produccion_tn_ha": "Produccion_t_ha",
+        "produccion_kg_ha": "Produccion_kg_ha",
+    }
+    df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns}, inplace=True)
+
     for col in ["Municipio", "Cultivo"]:
         if col in df.columns:
-            df[col] = df[col].astype(str).str.strip().str.title()
+            df[col] = df[col].apply(_standardize_string)
         else:
-            st.warning(f"La columna obligatoria '{col}' no se encontró en la base de datos.")
+            st.warning(f"La columna obligatoria '{col}' no está presente en el dataset.")
+
     if "Año" in df.columns:
         df["Año"] = pd.to_numeric(df["Año"], errors="coerce").astype("Int64")
     else:
-        st.warning("La columna obligatoria 'Año' no se encontró en la base de datos.")
-    if "Produccion_T_Ha" in df.columns:
-        df.rename(columns={"Produccion_T_Ha": "Produccion_t_ha"}, inplace=True)
+        st.warning("La columna obligatoria 'Año' no se encontró en el dataset.")
+
+    if "Produccion_kg_ha" in df.columns and "Produccion_t_ha" not in df.columns:
+        # Conversión de kg/ha a toneladas/ha
+        df["Produccion_t_ha"] = pd.to_numeric(df["Produccion_kg_ha"], errors="coerce") / 1000.0
+        st.info(
+            "Se detectó la columna 'Produccion_kg_ha'. Se convirtió automáticamente a"
+            " toneladas por hectárea."
+        )
+
     if "Produccion_t_ha" in df.columns:
         df["Produccion_t_ha"] = pd.to_numeric(df["Produccion_t_ha"], errors="coerce")
+        # Filtrado suave de outliers mediante IQR
+        series = df["Produccion_t_ha"].dropna()
+        if len(series) >= 10:
+            q1, q3 = series.quantile([0.25, 0.75])
+            iqr = q3 - q1
+            lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+            df.loc[df["Produccion_t_ha"].notna(), "Produccion_t_ha"] = df.loc[
+                df["Produccion_t_ha"].notna(), "Produccion_t_ha"
+            ].clip(lower, upper)
     else:
-        st.warning(
-            "La columna obligatoria 'Produccion_t_ha' no se encontró en la base de datos."
-        )
+        st.warning("La columna obligatoria 'Produccion_t_ha' no se encontró en el dataset.")
 
     return df
 
 
-def load_model_and_features(
-    model_path: Path = Path("model.pkl"), features_path: Path = Path("feature_cols.json")
-) -> Tuple[Optional[object], Optional[List[str]]]:
-    """Load the optional trained model and its feature list."""
-    if not model_path.exists() or not features_path.exists():
-        return None, None
+@st.cache_resource(show_spinner=False)
+def load_models() -> Dict[str, Optional[object]]:
+    """Carga los modelos opcionales disponibles en disco."""
+    models: Dict[str, Optional[object]] = {
+        "scaler_municipio": None,
+        "kmeans_municipio": None,
+        "scaler_modelo": None,
+        "modelo_rendimiento": None,
+        "feature_cols": None,
+    }
 
-    model: Optional[object] = None
-    feature_cols: Optional[List[str]] = None
+    if joblib is None:
+        st.warning("No se pudo importar joblib. Los modelos externos no estarán disponibles.")
+        return models
 
-    try:
-        if joblib is not None:
-            model = joblib.load(model_path)
-        else:  # pragma: no cover - fallback when joblib is absent
-            with model_path.open("rb") as file:
-                model = pickle.load(file)
-    except Exception as exc:
-        st.warning(f"No se pudo cargar 'model.pkl': {exc}")
-        model = None
+    file_map = {
+        "scaler_municipio": SCALER_MUNICIPIO_PATH,
+        "kmeans_municipio": KMEANS_MUNICIPIO_PATH,
+        "scaler_modelo": SCALER_MODELO_PATH,
+        "modelo_rendimiento": MODELO_RENDIMIENTO_PATH,
+        "feature_cols": FEATURE_COLS_PATH,
+    }
+    for key, path in file_map.items():
+        if not path.exists():
+            continue
+        try:
+            models[key] = joblib.load(path)
+        except Exception as exc:  # pragma: no cover - se comunica en UI
+            st.warning(f"No se pudo cargar '{path.name}': {exc}")
+            models[key] = None
 
-    try:
-        with features_path.open("r", encoding="utf-8") as file:
-            feature_cols = json.load(file)
-            if not isinstance(feature_cols, list):
-                raise ValueError("El archivo feature_cols.json debe contener una lista.")
-    except Exception as exc:
-        st.warning(f"No se pudo cargar 'feature_cols.json': {exc}")
-        feature_cols = None
+    if models["feature_cols"] is not None and not isinstance(models["feature_cols"], list):
+        st.warning(
+            "El archivo 'feature_cols.joblib' debe contener una lista de nombres de columnas."
+            " Se ignorará este archivo."
+        )
+        models["feature_cols"] = None
 
-    if model is None or feature_cols is None:
-        return None, None
-    return model, feature_cols
+    missing_models = [name for name in ["scaler_municipio", "kmeans_municipio"] if models[name] is None]
+    if missing_models:
+        st.warning(
+            "No se encontraron modelos de clusterización completos. Se recalculará"
+            " K-Means en caliente utilizando las variables climáticas disponibles."
+        )
+
+    if models["modelo_rendimiento"] is None:
+        st.warning(
+            "No se encontró 'modelo_rendimiento.joblib'. Se usarán promedios históricos"
+            " como respaldo para las predicciones."
+        )
+
+    return models
 
 
-def historical_yield(df: pd.DataFrame, municipio: str, cultivo: str) -> pd.DataFrame:
-    """Return the subset of historical data for a given municipality and crop."""
+def identify_climate_columns(df: pd.DataFrame) -> List[str]:
     if df.empty:
-        return pd.DataFrame()
-    required_cols = {"Municipio", "Cultivo", "Año", "Produccion_t_ha"}
-    if not required_cols.issubset(df.columns):
-        return pd.DataFrame()
-    subset = df[(df["Municipio"] == municipio) & (df["Cultivo"] == cultivo)].copy()
-    subset = subset.dropna(subset=["Año", "Produccion_t_ha"]).sort_values("Año")
-    return subset
+        return []
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    exclude = {"Produccion_t_ha", "Produccion_kg_ha", "Año"} | EXCLUDED_FEATURES
+    return [col for col in numeric_cols if col not in exclude]
 
 
-def _sanitize_label(value: str) -> str:
-    return (
-        str(value)
-        .strip()
-        .lower()
-        .replace("á", "a")
-        .replace("é", "e")
-        .replace("í", "i")
-        .replace("ó", "o")
-        .replace("ú", "u")
-        .replace("ñ", "n")
-        .replace(" ", "_")
+def assign_clusters(
+    df: pd.DataFrame, models: Dict[str, Optional[object]], climate_cols: List[str]
+) -> Tuple[Dict[str, int], Optional[StandardScaler], Optional[KMeans]]:
+    """Asigna clusters a todos los municipios utilizando los modelos disponibles o K-Means en caliente."""
+    if df.empty or not climate_cols:
+        return {}, None, None
+
+    muni_climate = (
+        df.groupby("Municipio")[climate_cols]
+        .mean(numeric_only=True)
+        .replace([np.inf, -np.inf], np.nan)
     )
+    muni_climate = muni_climate.fillna(muni_climate.mean(numeric_only=True))
+
+    scaler: Optional[StandardScaler] = None
+    kmeans: Optional[KMeans] = None
+    X = muni_climate.values
+
+    if models.get("scaler_municipio") is not None and models.get("kmeans_municipio") is not None:
+        scaler = models["scaler_municipio"]  # type: ignore[assignment]
+        kmeans = models["kmeans_municipio"]  # type: ignore[assignment]
+        try:
+            X_scaled = scaler.transform(X)  # type: ignore[arg-type]
+            clusters = kmeans.predict(X_scaled)  # type: ignore[arg-type]
+            return dict(zip(muni_climate.index, clusters)), scaler, kmeans
+        except Exception:
+            st.warning(
+                "No se pudieron usar los modelos de clusterización existentes. Se recalculará"
+                " un nuevo K-Means con los datos actuales."
+            )
+
+    if StandardScaler is None or KMeans is None:
+        st.error(
+            "scikit-learn no está disponible. No es posible crear clusters sin las"
+            " dependencias necesarias."
+        )
+        return {}, None, None
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    n_municipios = len(muni_climate)
+    n_clusters = max(min(6, max(n_municipios // 5, 2)), 2)
+    kmeans = KMeans(n_clusters=n_clusters, n_init="auto", random_state=RANDOM_STATE)
+    clusters = kmeans.fit_predict(X_scaled)
+    return dict(zip(muni_climate.index, clusters)), scaler, kmeans
+
+
+def infer_cluster(
+    municipio: str,
+    df: pd.DataFrame,
+    climate_cols: List[str],
+    cluster_map: Dict[str, int],
+    scaler: Optional[StandardScaler],
+    kmeans: Optional[KMeans],
+) -> Optional[int]:
+    if municipio in cluster_map:
+        return cluster_map[municipio]
+
+    if municipio not in df["Municipio"].unique():
+        return None
+
+    muni_values = (
+        df[df["Municipio"] == municipio][climate_cols]
+        .mean(numeric_only=True)
+        .fillna(df[climate_cols].mean(numeric_only=True))
+    )
+
+    if scaler is not None and kmeans is not None:
+        try:
+            transformed = scaler.transform([muni_values.values])  # type: ignore[arg-type]
+            cluster = int(kmeans.predict(transformed)[0])  # type: ignore[arg-type]
+            return cluster
+        except Exception:
+            pass
+
+    if StandardScaler is None or KMeans is None:
+        return None
+
+    muni_climate = (
+        df.groupby("Municipio")[climate_cols]
+        .mean(numeric_only=True)
+        .replace([np.inf, -np.inf], np.nan)
+    )
+    if muni_climate.empty:
+        return None
+    muni_climate = muni_climate.fillna(muni_climate.mean(numeric_only=True))
+
+    scaler_local = StandardScaler()
+    transformed = scaler_local.fit_transform(muni_climate.values)
+    n_municipios = len(muni_climate)
+    n_clusters = max(min(6, max(n_municipios // 5, 2)), 2)
+    kmeans_local = KMeans(n_clusters=n_clusters, n_init="auto", random_state=RANDOM_STATE)
+    labels = kmeans_local.fit_predict(transformed)
+    local_map = dict(zip(muni_climate.index, labels))
+    return local_map.get(municipio)
+
+
+def infer_feature_columns(df: pd.DataFrame, feature_cols: Optional[List[str]]) -> List[str]:
+    if feature_cols:
+        return feature_cols
+    climate_cols = identify_climate_columns(df)
+    if climate_cols:
+        st.info(
+            "Se infirieron las columnas de características a partir de las variables"
+            " climáticas disponibles."
+        )
+    return climate_cols
 
 
 def prepare_features(
     df: pd.DataFrame,
     municipio: str,
     cultivo: str,
-    feature_cols: Optional[List[str]],
+    feature_cols: List[str],
     year: Optional[int] = None,
 ) -> Optional[pd.DataFrame]:
-    """Build the feature vector for model inference using municipal averages."""
-    if feature_cols is None or df.empty:
+    if df.empty or not feature_cols:
         return None
 
-    available_cols = set(df.columns)
-    df_mun = df[df["Municipio"] == municipio] if "Municipio" in df.columns else pd.DataFrame()
-    features: Dict[str, float] = {}
+    df_muni = df[df["Municipio"] == municipio]
     global_means = df.mean(numeric_only=True)
-    muni_means = df_mun.mean(numeric_only=True) if not df_mun.empty else pd.Series(dtype=float)
-    used_proxies = False
+    muni_means = df_muni.mean(numeric_only=True)
+
+    features: Dict[str, float] = {}
 
     for col in feature_cols:
-        value: Optional[float] = None
-        if col == "Municipio":
-            value = municipio
-        elif col == "Cultivo":
-            value = cultivo
-        elif col == "Año":
-            if year is not None:
-                value = year
-            else:
-                if "Año" in df_mun.columns and not df_mun["Año"].dropna().empty:
-                    value = float(df_mun["Año"].dropna().iloc[-1])
-                elif "Año" in df.columns and not df["Año"].dropna().empty:
+        value: float
+        if col in {"Municipio", "Cultivo"}:
+            # Si el modelo requiere columnas categóricas sin codificar, no se pueden usar directamente.
+            if not st.session_state.get("_warn_raw_categorical", False):
+                st.session_state["_warn_raw_categorical"] = True
+                st.warning(
+                    "El modelo de rendimiento requiere columnas categóricas sin codificar."
+                    " Se asignará un valor nulo a dichas columnas."
+                )
+            features[col] = np.nan
+            continue
+        if col in EXCLUDED_FEATURES:
+            if col == "Año":
+                if year is not None:
+                    value = float(year)
+                elif "Año" in df_muni.columns and df_muni["Año"].notna().any():
+                    value = float(df_muni["Año"].dropna().max())
+                elif "Año" in df.columns and df["Año"].notna().any():
                     value = float(df["Año"].dropna().max())
                 else:
-                    value = datetime.datetime.now().year
-        elif col.startswith("Municipio_"):
-            value = 1.0 if _sanitize_label(municipio) == _sanitize_label(col.split("Municipio_", 1)[1]) else 0.0
-        elif col.startswith("Cultivo_"):
-            value = 1.0 if _sanitize_label(cultivo) == _sanitize_label(col.split("Cultivo_", 1)[1]) else 0.0
-        elif col in available_cols:
-            serie_mun = df_mun[col] if not df_mun.empty and col in df_mun.columns else pd.Series(dtype=float)
-            if pd.api.types.is_numeric_dtype(df[col]):
-                if not serie_mun.empty:
-                    value = float(serie_mun.dropna().mean())
-                if value is None or np.isnan(value):
-                    value = float(df[col].dropna().mean()) if not df[col].dropna().empty else None
+                    value = float(pd.Timestamp.now().year)
             else:
-                if not serie_mun.empty:
-                    mode = serie_mun.dropna().mode()
-                    if not mode.empty:
-                        value = mode.iloc[0]
-                if value is None:
-                    mode = df[col].dropna().mode()
-                    if not mode.empty:
-                        value = mode.iloc[0]
+                value = float(df[col].dropna().mean()) if col in df.columns else np.nan
+            features[col] = value
+            continue
+        if col.startswith("Municipio_"):
+            value = 1.0 if col.split("Municipio_", 1)[1].strip().lower() == municipio.lower() else 0.0
+            features[col] = value
+            continue
+        if col.startswith("Cultivo_"):
+            value = 1.0 if col.split("Cultivo_", 1)[1].strip().lower() == cultivo.lower() else 0.0
+            features[col] = value
+            continue
+        series_muni = df_muni[col] if col in df_muni.columns else pd.Series(dtype=float)
+        if not series_muni.empty and pd.api.types.is_numeric_dtype(series_muni):
+            value = float(series_muni.dropna().mean())
+        elif col in df.columns and pd.api.types.is_numeric_dtype(df[col]):
+            value = float(df[col].dropna().mean())
+        elif col in global_means.index:
+            value = float(global_means[col])
+        elif col in muni_means.index:
+            value = float(muni_means[col])
         else:
-            st.warning(f"La característica '{col}' no está presente en los datos históricos.")
-
-        if value is None:
-            if col in muni_means.index and not np.isnan(muni_means[col]):
-                value = float(muni_means[col])
-                used_proxies = True
-            elif col in global_means.index and not np.isnan(global_means[col]):
-                value = float(global_means[col])
-                used_proxies = True
-            else:
-                value = 0.0
-                used_proxies = True
+            value = np.nan
         features[col] = value
 
-    feature_df = pd.DataFrame([features])
-    feature_df.attrs["used_proxies"] = used_proxies
-    return feature_df
-
-
-def _historical_projection(hist_df: pd.DataFrame, target_year: int) -> Tuple[Optional[float], bool]:
-    if hist_df.empty:
-        return None, False
-    years = hist_df["Año"].to_numpy(dtype=float)
-    values = hist_df["Produccion_t_ha"].to_numpy(dtype=float)
-    if len(np.unique(years)) > 1:
-        try:
-            slope, intercept = np.polyfit(years, values, 1)
-            prediction = float(slope * target_year + intercept)
-            return prediction, True
-        except Exception:  # pragma: no cover - numerical edge cases
-            pass
-    return float(np.nanmean(values)), False
+    features_df = pd.DataFrame([features])
+    features_df = features_df.replace([np.inf, -np.inf], np.nan)
+    features_df = features_df.fillna(features_df.mean(numeric_only=True))
+    features_df = features_df.fillna(0.0)
+    return features_df
 
 
 def predict_yield(
-    model: Optional[object],
-    feature_cols: Optional[List[str]],
+    df: pd.DataFrame,
     municipio: str,
     cultivo: str,
-    df: pd.DataFrame,
+    models: Dict[str, Optional[object]],
+    feature_cols: List[str],
     year: Optional[int] = None,
-) -> Tuple[Optional[float], bool]:
-    """Predict the expected yield using the trained model if available."""
-    if model is None or feature_cols is None:
-        return None, False
+) -> Tuple[Optional[float], str, bool]:
+    """Predice el rendimiento esperado para un cultivo y municipio."""
+    modelo = models.get("modelo_rendimiento")
+    scaler = models.get("scaler_modelo")
+    features = prepare_features(df, municipio, cultivo, feature_cols, year=year)
 
-    features_df = prepare_features(df, municipio, cultivo, feature_cols, year=year)
-    if features_df is None:
-        return None, False
+    if modelo is not None and features is not None and not features.empty:
+        try:
+            X = features.values
+            if scaler is not None:
+                X = scaler.transform(X)  # type: ignore[arg-type]
+            pred = float(modelo.predict(X)[0])  # type: ignore[arg-type]
+            return pred, "Modelo", True
+        except Exception:
+            st.warning(
+                "El modelo de rendimiento no pudo generar una predicción. Se usará el"
+                " historial como respaldo."
+            )
 
-    used_proxies = bool(features_df.attrs.get("used_proxies"))
-    try:
-        prediction = model.predict(features_df)[0]
-        return float(prediction), used_proxies
-    except Exception as exc:
-        st.warning(f"No se pudo generar una predicción para {cultivo}: {exc}")
-        return None, used_proxies
+    subset = df[(df["Municipio"] == municipio) & (df["Cultivo"] == cultivo)]
+    if not subset.empty and "Produccion_t_ha" in subset.columns and subset["Produccion_t_ha"].notna().any():
+        return float(subset["Produccion_t_ha"].mean()), "Histórico municipal", False
+
+    global_subset = df[df["Cultivo"] == cultivo]
+    if (
+        not global_subset.empty
+        and "Produccion_t_ha" in global_subset.columns
+        and global_subset["Produccion_t_ha"].notna().any()
+    ):
+        return float(global_subset["Produccion_t_ha"].mean()), "Promedio global", False
+
+    if "Produccion_t_ha" in df.columns and df["Produccion_t_ha"].notna().any():
+        return float(df["Produccion_t_ha"].mean()), "Promedio global", False
+
+    return None, "Sin datos", False
+
+
+def historical_stats(df: pd.DataFrame, municipio: str, cultivo: str) -> Dict[str, Optional[float]]:
+    subset = df[(df["Municipio"] == municipio) & (df["Cultivo"] == cultivo)]
+    subset = subset.dropna(subset=["Produccion_t_ha"])
+    if subset.empty:
+        return {"min": None, "mean": None, "max": None, "years": pd.Series(dtype="Int64")}
+    return {
+        "min": float(subset["Produccion_t_ha"].min()),
+        "mean": float(subset["Produccion_t_ha"].mean()),
+        "max": float(subset["Produccion_t_ha"].max()),
+        "years": subset["Año"].dropna().astype(int),
+        "values": subset["Produccion_t_ha"].dropna(),
+        "data": subset.sort_values("Año"),
+    }
+
+
+def compute_popularity_metrics(
+    df: pd.DataFrame, cluster_map: Dict[str, int]
+) -> Tuple[Dict[str, float], Dict[Tuple[int, str], float]]:
+    if df.empty or "Produccion_t_ha" not in df.columns:
+        return {}, {}
+
+    mean_yields = (
+        df.dropna(subset=["Produccion_t_ha"])
+        .groupby(["Municipio", "Cultivo"])["Produccion_t_ha"]
+        .mean()
+    )
+    if mean_yields.empty:
+        return {}, {}
+
+    top_pairs: Dict[str, str] = {}
+    for municipio, group in mean_yields.groupby(level=0):
+        if group.isna().all():
+            continue
+        cultivo = group.idxmax()[1]
+        top_pairs[municipio] = cultivo
+
+    total_munis = len(top_pairs) or 1
+    freq_global: Dict[str, float] = {}
+    for cultivo in top_pairs.values():
+        freq_global[cultivo] = freq_global.get(cultivo, 0.0) + 1.0 / total_munis
+
+    cluster_counts: Dict[int, float] = {}
+    freq_cluster: Dict[Tuple[int, str], float] = {}
+    for municipio, cultivo in top_pairs.items():
+        cluster = cluster_map.get(municipio)
+        if cluster is None:
+            continue
+        cluster_counts[cluster] = cluster_counts.get(cluster, 0.0) + 1.0
+        key = (cluster, cultivo)
+        freq_cluster[key] = freq_cluster.get(key, 0.0) + 1.0
+
+    for key, value in list(freq_cluster.items()):
+        cluster = key[0]
+        freq_cluster[key] = value / max(cluster_counts.get(cluster, 1.0), 1.0)
+
+    return freq_global, freq_cluster
+
+
+def rank_crops_in_municipio(
+    df: pd.DataFrame,
+    municipio: str,
+    models: Dict[str, Optional[object]],
+    feature_cols: List[str],
+    cluster: Optional[int],
+    freq_global: Dict[str, float],
+    freq_cluster: Dict[Tuple[int, str], float],
+    std_global: float,
+) -> Tuple[pd.DataFrame, Optional[pd.Series]]:
+    muni_subset = df[df["Municipio"] == municipio]
+    crops = sorted(muni_subset["Cultivo"].dropna().unique().tolist())
+    if not crops:
+        crops = sorted(df["Cultivo"].dropna().unique().tolist())
+
+    if not crops:
+        return pd.DataFrame(), None
+
+    rng = np.random.default_rng(RANDOM_STATE)
+    alpha = DIV_PENALTY_FACTOR * (std_global or 1.0)
+    beta = DIV_PENALTY_FACTOR * (std_global or 1.0)
+
+    records = []
+    for cultivo in crops:
+        pred, source, used_model = predict_yield(df, municipio, cultivo, models, feature_cols)
+        if pred is None:
+            continue
+
+        hist_subset = df[(df["Municipio"] == municipio) & (df["Cultivo"] == cultivo)]
+        hist_var = float(hist_subset["Produccion_t_ha"].var()) if not hist_subset.empty else math.inf
+
+        penalizacion = alpha * freq_global.get(cultivo, 0.0)
+        bono = beta
+        if cluster is not None:
+            bono *= 1.0 - freq_cluster.get((cluster, cultivo), 0.0)
+        diversificacion = -penalizacion + bono
+        score = pred + diversificacion
+
+        records.append(
+            {
+                "Cultivo": cultivo,
+                "Rendimiento_esperado_t_ha": pred,
+                "Fuente": source,
+                "Cluster": cluster if cluster is not None else "Sin cluster",
+                "Penalización_diversificación": diversificacion,
+                "Score": score,
+                "Varianza_historica": hist_var if not np.isnan(hist_var) else math.inf,
+                "Aleatorio": rng.random(),
+            }
+        )
+
+    if not records:
+        return pd.DataFrame(), None
+
+    ranking = pd.DataFrame(records)
+    ranking.sort_values(
+        by=["Score", "Varianza_historica", "Aleatorio"], ascending=[False, True, True], inplace=True
+    )
+    ranking.reset_index(drop=True, inplace=True)
+
+    return ranking.drop(columns=["Score", "Aleatorio"]), ranking.iloc[0]
+
+
+def project_future_yield(
+    df: pd.DataFrame,
+    municipio: str,
+    cultivo: str,
+    models: Dict[str, Optional[object]],
+    feature_cols: List[str],
+    historical: Dict[str, Optional[float]],
+) -> Tuple[List[int], List[float], str]:
+    data = historical.get("data")
+    if data is None or data.empty:
+        return [], [], "Sin datos históricos"
+
+    years = data["Año"].dropna().astype(int)
+    values = data["Produccion_t_ha"].dropna()
+    if years.empty or values.empty:
+        return [], [], "Sin datos históricos"
+
+    last_year = int(years.max())
+    future_years = [last_year + 1, last_year + 2]
+
+    preds: List[float] = []
+    source = "Histórico"
+    for future_year in future_years:
+        pred, pred_source, used_model = predict_yield(
+            df, municipio, cultivo, models, feature_cols, year=future_year
+        )
+        if used_model and pred is not None:
+            preds.append(pred)
+            source = pred_source
+        else:
+            preds = []
+            break
+
+    if preds:
+        return future_years, preds, source
+
+    # Respaldo con tendencia lineal simple
+    if len(years.unique()) >= 2:
+        coeffs = np.polyfit(years, values, 1)
+        preds = [float(np.polyval(coeffs, y)) for y in future_years]
+        return future_years, preds, "Tendencia lineal"
+
+    mean_value = float(values.mean())
+    preds = [mean_value for _ in future_years]
+    return future_years, preds, "Promedio histórico"
+
+
+def plot_best_crop_timeseries(
+    municipio: str,
+    cultivo: str,
+    historical: Dict[str, Optional[float]],
+    future_years: List[int],
+    future_preds: List[float],
+    future_source: str,
+) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(8, 4))
+    data = historical.get("data")
+    if data is not None and not data.empty:
+        ax.plot(
+            data["Año"],
+            data["Produccion_t_ha"],
+            marker="o",
+            label="Histórico",
+        )
+    if future_years and future_preds:
+        ax.plot(
+            future_years,
+            future_preds,
+            marker="o",
+            linestyle="--",
+            label=f"Proyección ({future_source})",
+        )
+    ax.set_title(f"Evolución de producción para {cultivo} en {municipio}")
+    ax.set_xlabel("Año")
+    ax.set_ylabel("Producción (t/ha)")
+    ax.grid(True, alpha=0.2)
+    ax.legend()
+    fig.tight_layout()
+    return fig
+
+
+def show_sidebar_help() -> None:
+    with st.sidebar:
+        st.header("Ayuda rápida")
+        st.markdown(
+            """
+            1. Coloca los archivos `df_final.csv` y los modelos `.joblib` en la misma carpeta que `app.py`.
+            2. Ejecuta la aplicación con: `streamlit run app.py`.
+            3. Actualiza los archivos y reinicia la app para refrescar los datos.
+            """
+        )
+        st.info("La aplicación puede trabajar sin modelos, utilizando promedios históricos.")
 
 
 def main() -> None:
     st.set_page_config(page_title="Recomendador de cultivos por municipio", layout="wide")
-    st.sidebar.markdown(
-        "**Instrucciones**\n\n"
-        "Coloca `df_final.csv` (y opcionalmente `model.pkl` junto con `feature_cols.json`)\n"
-        "en la misma carpeta que este archivo.\n\n"
-        "Ejecuta: `streamlit run app.py`."
-    )
-
     st.title("Recomendador de cultivos por municipio")
+    show_sidebar_help()
 
     df = load_data()
-    model, feature_cols = load_model_and_features()
+    models = load_models()
 
-    if model is None or feature_cols is None:
-        st.info(
-            "No se encontró un modelo entrenado. Se utilizará el respaldo histórico para"
-            " estimar los rendimientos."
-        )
+    if df.empty:
+        st.info("Carga un archivo 'df_final.csv' para comenzar a explorar recomendaciones.")
+        return
 
-    if df.empty or not {"Municipio", "Cultivo"}.issubset(df.columns):
-        st.stop()
+    climate_cols = identify_climate_columns(df)
+    cluster_map, scaler_used, kmeans_used = assign_clusters(df, models, climate_cols)
+    freq_global, freq_cluster = compute_popularity_metrics(df, cluster_map)
+    feature_cols = infer_feature_columns(df, models.get("feature_cols"))
+    std_global = float(df["Produccion_t_ha"].std()) if "Produccion_t_ha" in df.columns else 1.0
+    if math.isnan(std_global) or std_global == 0:
+        std_global = 1.0
 
-    municipios = sorted(df["Municipio"].dropna().unique())
+    municipios = sorted(df["Municipio"].dropna().unique().tolist())
     if not municipios:
-        st.info("No hay municipios disponibles para mostrar.")
-        st.stop()
+        st.warning("No se encontraron municipios en el dataset.")
+        return
 
-    municipio = st.selectbox("Municipio", municipios, index=0)
+    municipio = st.selectbox("Selecciona un municipio", municipios)
+    if not municipio:
+        return
 
-    df_municipio = df[df["Municipio"] == municipio]
-    cultivos_municipio = sorted(df_municipio["Cultivo"].dropna().unique())
-    if not cultivos_municipio:
-        st.info("No hay cultivos registrados para este municipio.")
-        st.stop()
-    cultivo_principal = st.selectbox("Cultivo principal", cultivos_municipio, index=0)
+    st.markdown(f"**Municipio seleccionado: {municipio}**")
 
-    candidatos = [c for c in cultivos_municipio if c != cultivo_principal]
-    otros_cultivos = st.multiselect(
-        "Otros cultivos a evaluar",
-        cultivos_municipio,
-        default=candidatos,
-    )
-
-    if "auto_run_done" not in st.session_state:
-        st.session_state["auto_run_done"] = False
-
-    ejecutar = st.button("Evaluar")
-    if not st.session_state["auto_run_done"]:
-        ejecutar = True
-        st.session_state["auto_run_done"] = True
-
-    if not ejecutar:
-        st.stop()
-
-    current_year = datetime.datetime.now().year
-
-    st.subheader("A. Evolución del cultivo principal")
-    hist_df = historical_yield(df, municipio, cultivo_principal)
-    if hist_df.empty:
-        st.info(
-            "No se encontraron registros históricos suficientes para el cultivo seleccionado."
-        )
+    cluster = infer_cluster(municipio, df, climate_cols, cluster_map, scaler_used, kmeans_used)
+    if cluster is not None:
+        st.markdown(f"Cluster detectado: **{cluster}**")
     else:
-        min_prod = float(hist_df["Produccion_t_ha"].min())
-        max_prod = float(hist_df["Produccion_t_ha"].max())
-        mean_prod = float(hist_df["Produccion_t_ha"].mean())
+        st.warning("No fue posible determinar el cluster para este municipio.")
 
-        pred_model, used_proxy_model = predict_yield(
-            model, feature_cols, municipio, cultivo_principal, df, year=current_year
+    if st.button("Calcular mejores cultivos"):
+        ranking, best_row = rank_crops_in_municipio(
+            df,
+            municipio,
+            models,
+            feature_cols,
+            cluster,
+            freq_global,
+            freq_cluster,
+            std_global,
         )
-        pred_hist, used_regression = _historical_projection(hist_df, current_year)
 
+        if ranking.empty or best_row is None:
+            st.warning("No se pudieron calcular recomendaciones para este municipio.")
+            return
+
+        st.subheader("Ranking de cultivos recomendados")
+        display_cols = [
+            "Cultivo",
+            "Rendimiento_esperado_t_ha",
+            "Fuente",
+            "Cluster",
+            "Penalización_diversificación",
+        ]
+        st.dataframe(ranking.loc[:, display_cols], use_container_width=True)
+
+        best_cultivo = best_row["Cultivo"]
+        st.subheader(f"Métricas del cultivo destacado: {best_cultivo}")
+        hist = historical_stats(df, municipio, best_cultivo)
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("Mínimo histórico (t/ha)", f"{min_prod:.2f}")
-        col2.metric("Máximo histórico (t/ha)", f"{max_prod:.2f}")
-        col3.metric("Promedio histórico (t/ha)", f"{mean_prod:.2f}")
-        if pred_model is not None:
-            comentario = "con promedios municipales" if used_proxy_model else ""
-            col4.metric(
-                "Predicción próxima campaña (t/ha)",
-                f"{pred_model:.2f}",
-                comentario,
-            )
-        elif pred_hist is not None:
-            comentario = "Regresión histórica" if used_regression else "Promedio histórico"
-            col4.metric("Proyección próxima campaña (t/ha)", f"{pred_hist:.2f}", comentario)
-        else:
-            col4.metric("Proyección próxima campaña (t/ha)", "Sin datos")
+        col1.metric("Mínimo histórico (t/ha)", f"{hist.get('min', np.nan):.2f}" if hist.get("min") is not None else "N/D")
+        col2.metric("Promedio histórico (t/ha)", f"{hist.get('mean', np.nan):.2f}" if hist.get("mean") is not None else "N/D")
+        col3.metric("Máximo histórico (t/ha)", f"{hist.get('max', np.nan):.2f}" if hist.get("max") is not None else "N/D")
 
-        fig_hist, ax_hist = plt.subplots()
-        ax_hist.plot(hist_df["Año"], hist_df["Produccion_t_ha"], marker="o", label="Producción histórica")
+        future_years, future_preds, future_source = project_future_yield(
+            df, municipio, best_cultivo, models, feature_cols, hist
+        )
+        next_pred = future_preds[0] if future_preds else None
+        col4.metric(
+            "Predicción próximo año (t/ha)",
+            f"{next_pred:.2f}" if next_pred is not None else "N/D",
+        )
 
-        future_years = []
-        if model is not None and feature_cols is not None:
-            last_year = int(hist_df["Año"].max()) if not hist_df["Año"].empty else current_year
-            future_years = list(range(last_year + 1, current_year + 3))
-            predicted_values = []
-            for year in future_years:
-                pred_value, _ = predict_yield(model, feature_cols, municipio, cultivo_principal, df, year=year)
-                if pred_value is not None:
-                    predicted_values.append((year, pred_value))
-            if predicted_values:
-                years_pred, values_pred = zip(*predicted_values)
-                ax_hist.plot(years_pred, values_pred, marker="^", label="Predicción")
+        fig = plot_best_crop_timeseries(
+            municipio,
+            best_cultivo,
+            hist,
+            future_years,
+            future_preds,
+            future_source,
+        )
+        st.pyplot(fig)
 
-        ax_hist.set_title(f"Producción de {cultivo_principal} en {municipio}")
-        ax_hist.set_xlabel("Año")
-        ax_hist.set_ylabel("Producción (t/ha)")
-        ax_hist.legend()
-        st.pyplot(fig_hist)
-
-        if future_years and model is not None:
-            st.caption(
-                "Las predicciones futuras utilizan el modelo cargado y, cuando no hay"
-                " datos climáticos específicos por año, se emplean los promedios"
-                " municipales como aproximación."
-            )
-
-    st.subheader("B. Sugerencia de otros cultivos")
-    resultados: List[Dict[str, object]] = []
-    global_mean_all = (
-        float(df["Produccion_t_ha"].mean())
-        if "Produccion_t_ha" in df.columns and not df["Produccion_t_ha"].dropna().empty
-        else np.nan
-    )
-
-    if not otros_cultivos:
-        st.info("Selecciona al menos un cultivo adicional para evaluar.")
-    else:
-        for cultivo in otros_cultivos:
-            metodo = ""
-            comentario = ""
-            rendimiento = None
-
-            pred, used_proxy = predict_yield(model, feature_cols, municipio, cultivo, df, year=current_year)
-            if pred is not None:
-                rendimiento = pred
-                metodo = "Modelo"
-                if used_proxy:
-                    comentario = "Se usaron promedios municipales para completar variables."
-            else:
-                hist_df_cultivo = historical_yield(df, municipio, cultivo)
-                rendimiento_hist, used_regression = _historical_projection(hist_df_cultivo, current_year)
-                if rendimiento_hist is not None and not np.isnan(rendimiento_hist):
-                    rendimiento = rendimiento_hist
-                    metodo = "Histórico municipal"
-                    if not used_regression:
-                        comentario = "Promedio histórico municipal."
-                    else:
-                        comentario = "Regresión lineal histórica."
-                else:
-                    global_df = df[df["Cultivo"] == cultivo]
-                    if not global_df.empty:
-                        rendimiento = float(global_df["Produccion_t_ha"].mean())
-                        metodo = "Promedio global"
-                        comentario = "Sin histórico municipal, se usa promedio global."
-                    else:
-                        rendimiento = global_mean_all
-                        metodo = "Promedio global"
-                        comentario = (
-                            "Sin datos del cultivo, se usa el promedio global de la base."
-                        )
-
-            if rendimiento is not None and not np.isnan(rendimiento):
-                resultados.append(
-                    {
-                        "Cultivo": cultivo,
-                        "Rendimiento_esperado_t_ha": float(rendimiento),
-                        "Metodo_estimacion": metodo,
-                        "Comentario": comentario,
-                    }
+        otros = ranking[ranking["Cultivo"] != best_cultivo].head(5)
+        if not otros.empty:
+            st.subheader("Otros cultivos con buen rendimiento esperado")
+            for _, row in otros.iterrows():
+                st.markdown(
+                    f"- **{row['Cultivo']}**: {row['Rendimiento_esperado_t_ha']:.2f} t/ha"
+                    f" · Fuente: {row['Fuente']}"
                 )
 
-        if resultados:
-            resultados_df = pd.DataFrame(resultados)
-            resultados_df = resultados_df.sort_values(
-                "Rendimiento_esperado_t_ha", ascending=False
-            ).reset_index(drop=True)
-            st.dataframe(resultados_df)
+        if "Ciclo_de_cultivo" in df.columns:
+            ciclos = (
+                df[(df["Municipio"] == municipio) & (df["Cultivo"] == best_cultivo)][
+                    "Ciclo_de_cultivo"
+                ]
+                .dropna()
+                .unique()
+            )
+            if ciclos.size:
+                st.info(
+                    "Ciclos de cultivo registrados (no editables): "
+                    + ", ".join(sorted(map(str, ciclos)))
+                )
 
-            fig_bar, ax_bar = plt.subplots()
-            ax_bar.bar(resultados_df["Cultivo"], resultados_df["Rendimiento_esperado_t_ha"])
-            ax_bar.set_ylabel("Rendimiento esperado (t/ha)")
-            ax_bar.set_title(f"Rendimientos estimados en {municipio}")
-            st.pyplot(fig_bar)
-        else:
-            st.info("No fue posible calcular rendimientos esperados para los cultivos seleccionados.")
+        with st.expander("Diagnóstico de clusters (top-1 histórico por cluster)"):
+            if cluster_map:
+                cluster_summary: Dict[int, List[str]] = {}
+                for muni, clus in cluster_map.items():
+                    muni_data = df[df["Municipio"] == muni]
+                    if (
+                        "Produccion_t_ha" not in muni_data.columns
+                        or not muni_data["Produccion_t_ha"].notna().any()
+                    ):
+                        continue
+                    promedios = (
+                        muni_data.groupby("Cultivo")["Produccion_t_ha"].mean().dropna()
+                    )
+                    if promedios.empty:
+                        continue
+                    cultivo_top = promedios.idxmax()
+                    cluster_summary.setdefault(int(clus), []).append(cultivo_top)
+                if cluster_summary:
+                    diag_rows = []
+                    for clus, cultivos in cluster_summary.items():
+                        counts = pd.Series(cultivos).value_counts(normalize=True)
+                        diag_rows.append(
+                            {
+                                "Cluster": clus,
+                                "Cultivo": counts.index[0],
+                                "Frecuencia": counts.iloc[0],
+                            }
+                        )
+                    st.dataframe(pd.DataFrame(diag_rows), use_container_width=True)
+                else:
+                    st.write("No hay información histórica suficiente para el diagnóstico.")
+            else:
+                st.write("No hay información de clusters disponible.")
 
 
 if __name__ == "__main__":  # pragma: no cover
+    main()
+else:
+    # Streamlit ejecuta el script directamente, por lo que llamamos a main() siempre.
     main()
