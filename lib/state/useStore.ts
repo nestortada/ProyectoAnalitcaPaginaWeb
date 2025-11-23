@@ -15,6 +15,7 @@ export interface ResultData {
   yearsList: number[]
   recommended: { cultivo: string; mean_production: number }[]
   cluster: number | null
+  cultivo?: string
 }
 
 interface StoreState {

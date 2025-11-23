@@ -10,9 +10,11 @@ const Plot = dynamic<PlotParams>(() => import('react-plotly.js'), { ssr: false }
 interface ChartProps {
   labels: (number | string)[]
   values: number[]
+  municipio?: string
+  cultivo?: string
 }
 
-export default function ProyeccionChart({ labels, values }: ChartProps) {
+export default function ProyeccionChart({ labels, values, municipio, cultivo }: ChartProps) {
   return (
     <div className="overflow-x-auto">
       <Plot
@@ -27,7 +29,9 @@ export default function ProyeccionChart({ labels, values }: ChartProps) {
           },
         ]}
         layout={{
-          title: 'Proyección de producción',
+          title: `${
+            typeof municipio === 'string' && municipio ? `${municipio} — ` : ''
+          }Proyección de producción${cultivo ? `: ${cultivo}` : ''}`,
           xaxis: { title: 'Año' },
           yaxis: { title: 'Producción (t)' },
           height: 400,

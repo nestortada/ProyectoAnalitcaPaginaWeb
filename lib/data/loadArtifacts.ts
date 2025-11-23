@@ -76,3 +76,7 @@ export async function loadClusterScaling(): Promise<ClusterScaling> {
 export async function loadDfSummary(): Promise<DfSummary> {
   return fetchJSON<DfSummary>('/data/df_final_summary.json')
 }
+
+export async function loadGbPredictions(): Promise<Record<string, Record<string, Record<string, number | null>>>> {
+  return fetchJSON<Record<string, Record<string, Record<string, number | null>>>>('/data/gb_predictions.json')
+}

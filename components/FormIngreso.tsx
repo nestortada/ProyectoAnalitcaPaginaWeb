@@ -59,6 +59,7 @@ export default function FormIngreso() {
   const [clusterInfo, setClusterInfo] = useState<ClusterInfo | null>(null)
   const [municipios, setMunicipios] = useState<string[]>([])
   const [dfSummary, setDfSummary] = useState<DfSummary | null>(null)
+  const [gbPreds, setGbPreds] = useState<Record<string, Record<string, Record<string, number | null>>>>({})
 
   // Form state
   const [municipio, setMunicipio] = useState('')
@@ -66,6 +67,7 @@ export default function FormIngreso() {
   const [numericValues, setNumericValues] = useState<Record<string, number | undefined>>({})
   const [years, setYears] = useState(3)
   const [growthRate, setGrowthRate] = useState(0) // porcentaje anual
+  const [areaError, setAreaError] = useState<string | null>(null)
 
   // Cargar artefactos una vez
   useEffect(() => {
@@ -78,6 +80,13 @@ export default function FormIngreso() {
           loadClusterInfo(),
           loadDfSummary(),
         ])
+        // intentar cargar predicciones del modelo GB si existen
+        try {
+          const gb = await (await fetch('/data/gb_predictions.json')).json()
+          setGbPreds(gb)
+        } catch (e) {
+          // silencio: no hay predicciones GB
+        }
         setNumPre(np)
         setCatPre(cp)
         setModel(lm)
@@ -118,7 +127,46 @@ export default function FormIngreso() {
   const availableCultivos = useMemo(() => {
     if (!dfSummary) return []
     const muniEntry = municipio ? dfSummary.municipios[municipio] : undefined
-    const list = muniEntry?.cultivos?.length ? muniEntry.cultivos : dfSummary.cultivos
+    // Prefer the dfSummary per-municipio list; if missing, try clusterInfo's municipio_crops as fallback
+    let list: string[] | undefined = muniEntry?.cultivos?.length ? muniEntry.cultivos : undefined
+    if ((!list || list.length === 0) && clusterInfo && municipio) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ciAny: any = clusterInfo as any
+      const muniCrops = ciAny?.municipio_crops?.[municipio]
+      if (Array.isArray(muniCrops) && muniCrops.length) {
+        // Ensure items are strings and trimmed
+        list = muniCrops.map((c: string) => (typeof c === 'string' ? c.trim() : String(c)))
+      }
+    }
+    if (!list) list = dfSummary.cultivos
+    // Si tenemos info de clusters, y el municipio pertenece a cluster 0 o 1,
+    // restringimos la lista a los cultivos sugeridos para ese cluster.
+    try {
+      // access cluster info from state
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const ciAny: any = (clusterInfo as unknown) as any
+      if (ciAny && ciAny.municipio_cluster && municipio) {
+        const clu = ciAny.municipio_cluster[municipio]
+        if ((clu === 0 || clu === 1) && ciAny.cluster_crops && ciAny.cluster_crops[String(clu)]) {
+          // Instead of restricting (intersection), combine municipio list with cluster recommendations
+          // preserving municipio items first and appending cluster suggestions that are missing.
+          const clusterList: string[] = ciAny.cluster_crops[String(clu)].map((c: any) =>
+            typeof c.cultivo === 'string' ? c.cultivo.trim() : String(c.cultivo)
+          )
+          const seen = new Set<string>(list.map((c: string) => (typeof c === 'string' ? c.trim() : String(c))))
+          const combined = [...list]
+          clusterList.forEach((c) => {
+            if (!seen.has(c)) {
+              seen.add(c)
+              combined.push(c)
+            }
+          })
+          list = combined
+        }
+      }
+    } catch (e) {
+      // si algo falla, devolvemos la lista original
+    }
     return list
   }, [dfSummary, municipio])
 
@@ -160,16 +208,50 @@ export default function FormIngreso() {
 
   async function handleSubmit() {
     if (!numPre || !catPre || !model || !clusterInfo) return
+    // Validación: 'Área sembrada' es obligatoria
+    const areaSembrada = numericValues['Área sembrada']
+    if (typeof areaSembrada !== 'number' || Number.isNaN(areaSembrada)) {
+      setAreaError('El campo "Área sembrada" es obligatorio. Por favor ingresa un valor en hectáreas.')
+      return
+    }
+    setAreaError(null)
     // Construir inputs categóricos
     const catInput: Record<string, string | undefined> = {}
+    // Decidir qué cultivo usar para la predicción:
+    // 1) si el usuario seleccionó uno (intereses[0]) lo usamos;
+    // 2) si no, usamos la primera recomendación del cluster (si existe).
+    let cultivoForPrediction: string | undefined = intereses[0]
+    const cluster = getClusterForMunicipio(municipio, clusterInfo)
+    const recommended = getRecommendedCrops(cluster, clusterInfo, municipio, intereses, 5)
+    // Si no hay cultivo elegido por el usuario, seleccionamos uno de forma no determinista
+    if (!cultivoForPrediction) {
+      if (recommended.length > 0) {
+        // muestreamos entre las recomendaciones con probabilidad proporcional a la produccion media
+        const weights = recommended.map((r) => Math.max(r.mean_production ?? 1, 1))
+        const sum = weights.reduce((a, b) => a + b, 0)
+        let rnd = Math.random() * sum
+        for (let idx = 0; idx < recommended.length; idx++) {
+          rnd -= weights[idx]
+          if (rnd <= 0) {
+            cultivoForPrediction = recommended[idx].cultivo
+            break
+          }
+        }
+        cultivoForPrediction = cultivoForPrediction ?? recommended[0].cultivo
+      } else if (dfSummary && dfSummary.municipios[municipio]?.cultivos?.length) {
+        const list = dfSummary.municipios[municipio].cultivos
+        cultivoForPrediction = list[Math.floor(Math.random() * list.length)]
+      } else if (dfSummary && dfSummary.cultivos?.length) {
+        const list = dfSummary.cultivos
+        cultivoForPrediction = list[Math.floor(Math.random() * list.length)]
+      }
+    }
     catPre.features.forEach((f) => {
       if (f === 'Municipio') {
         catInput[f] = municipio
       } else if (f === 'Cultivo') {
-        // El cultivo seleccionado aquí no afecta al modelo de producción directamente; se usa 1er interés si existe
-        catInput[f] = intereses[0] ?? ''
+        catInput[f] = cultivoForPrediction ?? ''
       } else if (f === 'Grupo cultivo') {
-        // Derivar grupo cultivo del cultivo seleccionado si es posible; de lo contrario, undefined
         catInput[f] = undefined
       } else if (f === 'Estado físico del cultivo') {
         catInput[f] = undefined
@@ -186,25 +268,62 @@ export default function FormIngreso() {
     // Predecir para cada año
     const preds: number[] = []
     const yearsList: number[] = []
+    // baseYear: si el usuario proporcionó 'Año' lo usamos; si no, tomamos el año actual
+    const baseYear = typeof numericValues['Año'] === 'number' ? numericValues['Año']! : new Date().getFullYear()
+    // preparar datos para dinámica GB si existen predicciones precomputadas
+    const cultivoKey = cultivoForPrediction ?? ''
+    const muniKey = municipio
+    const gbEntryRoot = gbPreds?.[muniKey]?.[cultivoKey]
+    let prevGbValue: number | null = null
+    if (gbEntryRoot) {
+      const availableYearsRoot = Object.keys(gbEntryRoot).sort()
+      const baseYearStrRoot = String(baseYear)
+      const baseValRawRoot = gbEntryRoot[baseYearStrRoot] ?? gbEntryRoot[availableYearsRoot[0]]
+      prevGbValue = (baseValRawRoot as number) ?? 0
+    }
+
     for (let i = 0; i < years; i++) {
       const factor = Math.pow(1 + growthRate / 100, i)
       const numericClone: Record<string, number | undefined> = { ...numericValues }
       if (numericClone['Área sembrada'] !== undefined) {
         numericClone['Área sembrada'] = numericClone['Área sembrada']! * factor
       }
+      // Asegurar que 'Área cosechada' sea igual a 'Área sembrada' según requisito
+      if (numericClone['Área sembrada'] !== undefined) {
+        numericClone['Área cosechada'] = numericClone['Área sembrada']
+      }
       // Ajustar año (Año) sumando i
       if (numericClone['Año'] !== undefined) {
         numericClone['Año'] = numericClone['Año']! + i
       }
-      const vector = applyPipeline(numericClone, catInput, numPre, catPre)
-      const pred = predictLinear(vector, model)
+      // Si no tenemos el 'Ciclo del cultivo' en los valores numéricos, intentar tomarlo del resumen (excel/json)
+      if ((numericClone['Ciclo del cultivo'] === undefined || numericClone['Ciclo del cultivo'] === null) && dfSummary) {
+        const cicloFromSummary = cultivoForPrediction ? dfSummary.cultivo_ciclos[cultivoForPrediction] : undefined
+        if (typeof cicloFromSummary === 'number') {
+          numericClone['Ciclo del cultivo'] = cicloFromSummary
+        }
+      }
+      // intentamos usar predicción precomputada del GB (si existe) aplicando dinámica
+      const yearForPred = baseYear + i
+      let pred: number
+      const gbEntry = gbEntryRoot
+      if (gbEntry && prevGbValue !== null) {
+        // deriva aleatoria en [-3%, +3%] más el growthRate del usuario
+        const randomDrift = Math.random() * 0.06 - 0.03
+        const drift = growthRate / 100 + randomDrift
+        // ruido relativo ±2% del valor previo
+        const noise = (Math.random() * 0.04 - 0.02) * Math.abs(prevGbValue)
+        pred = prevGbValue * (1 + drift) + noise
+        prevGbValue = pred
+      } else {
+        const vector = applyPipeline(numericClone, catInput, numPre, catPre)
+        pred = predictLinear(vector, model)
+      }
       preds.push(pred)
-      yearsList.push(i + 1)
+      yearsList.push(baseYear + i)
     }
-    // Cluster y recomendaciones
-    const cluster = getClusterForMunicipio(municipio, clusterInfo)
-    const recommended = getRecommendedCrops(cluster, clusterInfo, municipio, intereses, 5)
-    setResultData({ predictions: preds, yearsList, recommended, cluster })
+    // Guardar resultado incluyendo el cultivo que se usó para la predicción
+    setResultData({ predictions: preds, yearsList, recommended, cluster, cultivo: cultivoForPrediction })
     router.push('/resultado')
   }
 
@@ -296,6 +415,9 @@ export default function FormIngreso() {
                   }
                   readOnly={isReadOnly}
                 />
+                  {feature === 'Área sembrada' && areaError && (
+                    <p className="text-sm text-red-600 mt-1">{areaError}</p>
+                  )}
               </div>
             )
           })}
@@ -336,6 +458,7 @@ export default function FormIngreso() {
       <button
         type="submit"
         className="mt-4 px-6 py-3 bg-primary text-white rounded-md hover:bg-primary-dark"
+        disabled={typeof numericValues['Área sembrada'] !== 'number' || Number.isNaN(numericValues['Área sembrada'] as any)}
       >
         Calcular recomendación
       </button>
