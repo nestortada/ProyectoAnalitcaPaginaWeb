@@ -1,72 +1,123 @@
-# Agro Recomendador
+# Manual de Usuario - Agro Recomendador
 
-Esta aplicación web utiliza datos históricos de producción y condiciones ambientales para sugerir cultivos con alto rendimiento esperado y proyectar la producción bajo distintos escenarios de manejo. Está construida con **Next.js 14**, **TypeScript**, **React**, **Tailwind CSS** y **Plotly**. Todo el procesamiento se realiza del lado del cliente: los artefactos de los modelos se exportan a JSON y se consumen directamente en el navegador.
+Bienvenido al manual de usuario de **Agro Recomendador**. Este documento le guiará a través de la instalación, ejecución y uso de la aplicación web diseñada para ayudar en la toma de decisiones agrícolas mediante análisis de datos y modelos predictivos.
 
-## Estructura del proyecto
+## 1. ¿Qué es y para qué sirve?
 
-```
-agro_app/
-├── app/               # Páginas de la App Router
-│   ├── layout.tsx     # Diseño raíz e importación de estilos globales
-│   ├── page.tsx       # Portada con el objetivo 2030
-│   ├── ingreso/page.tsx  # Formulario de ingreso de datos
-│   ├── resultado/page.tsx # Visualización de resultados y recomendaciones
-│   └── acerca/page.tsx    # Información sobre la metodología y glosario
-├── components/        # Componentes reutilizables (formularios, tarjetas, gráficos)
-├── lib/
-│   ├── data/          # Carga de artefactos y utilidades de datos
-│   └── inference/     # Implementaciones de preprocesamiento y modelos en TS
-├── public/data/       # Artefactos JSON y archivos de datos utilizados en el frontend
-├── tailwind.config.ts # Configuración de Tailwind CSS
-├── postcss.config.js  # Configuración de PostCSS
-├── next.config.js     # Configuración de Next.js
-├── vercel.json        # Configuración mínima para desplegar en Vercel
-├── package.json       # Dependencias y scripts
-├── tsconfig.json      # Configuración de TypeScript
-└── README.md          # Este documento
-```
+**Agro Recomendador** es una herramienta web interactiva que utiliza datos históricos y modelos de aprendizaje automático para:
+*   **Sugerir cultivos** con alto potencial de rendimiento para un municipio específico.
+*   **Proyectar la producción** estimada de cultivos bajo diferentes escenarios climáticos y de manejo.
+*   **Analizar condiciones** como temperatura, precipitación y características del suelo (pH) para optimizar la siembra.
 
-## Instalación y ejecución local
+El objetivo principal es apoyar a agricultores y planificadores en la selección de cultivos más rentables y sostenibles, alineándose con objetivos de seguridad alimentaria y producción responsable.
 
-1. Asegúrate de tener instalado [Node.js](https://nodejs.org/). Se recomiendan versiones 18 o superiores.
-2. Instala las dependencias del proyecto:
+---
 
-   ```bash
-   npm install
-   ```
+## 2. Requisitos del Sistema
 
-3. Ejecuta el servidor de desarrollo:
+Para ejecutar esta aplicación en su máquina local, necesitará lo siguiente:
 
-   ```bash
-   npm run dev
-   ```
+### Software
+*   **Node.js**: Entorno de ejecución para JavaScript. Se recomienda la versión **18 LTS** o superior.
+    *   [Descargar Node.js aquí](https://nodejs.org/)
+*   **Navegador Web**: Google Chrome, Mozilla Firefox, Microsoft Edge o Safari (versiones recientes).
+*   **Git** (Opcional): Para clonar el repositorio si no descargó el archivo ZIP.
 
-   La aplicación estará disponible en `http://localhost:3000`.
+### Hardware
+*   Cualquier computadora moderna (Windows, macOS o Linux) con acceso a internet para la instalación inicial de dependencias.
+*   Mínimo 4GB de RAM recomendado.
 
-4. Para generar una versión de producción usa:
+---
 
-   ```bash
-   npm run build
-   npm start
-   ```
+## 3. Instalación en su Máquina
 
-## Artefactos de modelos
+Siga estos pasos para instalar la aplicación en su computadora:
 
-Los modelos entrenados originalmente en Python se convirtieron a formato JSON para permitir su ejecución en el navegador. Estos archivos se encuentran en `public/data/`:
+1.  **Obtener el código fuente**:
+    *   Si tiene el archivo comprimido, descomprímalo en una carpeta de su elección.
+    *   Si usa Git, clone el repositorio:
+        ```bash
+        git clone <URL_DEL_REPOSITORIO>
+        ```
 
-- **numeric_preprocessor.json**: Medianas, medias y desviaciones estándar de las variables numéricas utilizadas para escalado y imputación.
-- **categorical_preprocessor.json**: Categorías posibles de las variables categóricas y sus valores más frecuentes (para imputar).
-- **linear_regression.json**: Coeficientes e intercepto del modelo de regresión lineal que predice la producción a partir de las variables transformadas.
-- **cluster_info.json**: Mapeo de municipios a sus etiquetas de cluster, lista de cultivos por municipio y ranking de cultivos por cluster según producción histórica.
-- **cluster_scaling_centroids.json**: Parámetros del escalado y centroides de los clusters (para posibles extensiones).
-- **df_final_con_clusters.xlsx**, **df_final_limpio.xlsx**: Archivos originales de datos para auditoría.
+2.  **Abrir la terminal**:
+    *   En Windows: Puede usar PowerShell o el Símbolo del sistema (CMD).
+    *   En Mac/Linux: Use la Terminal.
 
-El código en `lib/inference/` implementa las mismas transformaciones que en Python (imputación, escalado, one‑hot encoding y regresión lineal) usando TypeScript. No hay comunicación con un servidor backend; toda la lógica se ejecuta en el navegador.
+3.  **Navegar a la carpeta del proyecto**:
+    Use el comando `cd` para entrar a la carpeta donde están los archivos. Ejemplo:
+    ```bash
+    cd ruta/a/la/carpeta/agro_app
+    ```
 
-## Pruebas y validación
+4.  **Instalar dependencias**:
+    Ejecute el siguiente comando para descargar las librerías necesarias (esto puede tardar unos minutos):
+    ```bash
+    npm install
+    ```
 
-Se incluyen pruebas ligeras en la carpeta `lib/inference/__tests__/` (no mostrada aquí) que verifican que el preprocesamiento produce el mismo número de características que el modelo de entrenamiento y que la predicción para un registro de ejemplo es coherente. Para ejecutar las pruebas puedes usar `npm test` si configuras un entorno de pruebas como Jest.
+---
 
-## Licencia
+## 4. Cómo correr la página web
 
-Este proyecto se entrega como referencia educativa. Puedes adaptarlo y modificarlo según tus necesidades.
+Una vez instalada, tiene dos opciones para ejecutar la aplicación:
+
+### Opción A: Modo Desarrollo (Recomendado para pruebas)
+Este modo le permite ver cambios en tiempo real y es ideal para probar la aplicación rápidamente.
+
+1.  En la terminal, dentro de la carpeta del proyecto, ejecute:
+    ```bash
+    npm run dev
+    ```
+2.  Verá un mensaje indicando que el servidor está listo, generalmente en `http://localhost:3000`.
+3.  Abra su navegador web y visite esa dirección.
+
+### Opción B: Modo Producción (Para uso estable)
+Este modo optimiza la aplicación para que funcione más rápido.
+
+1.  Construya la aplicación:
+    ```bash
+    npm run build
+    ```
+2.  Inicie el servidor:
+    ```bash
+    npm start
+    ```
+3.  Abra su navegador en `http://localhost:3000`.
+
+---
+
+## 5. Guía de Uso
+
+Una vez que la aplicación esté corriendo en su navegador, siga este flujo de trabajo:
+
+### Paso 1: Pantalla de Inicio
+Encontrará una introducción al proyecto y su alineación con los Objetivos de Desarrollo Sostenible (ODS). Haga clic en el botón para **Ingresar Datos** o **Comenzar**.
+
+### Paso 2: Formulario de Ingreso
+En esta sección deberá proporcionar la información base para el análisis:
+*   **Municipio**: Seleccione el municipio de interés (la lista se carga automáticamente).
+*   **Cultivo (Opcional)**: Puede seleccionar un cultivo específico si desea ver su proyección, o dejarlo en blanco para ver recomendaciones generales.
+*   **Año**: El año para el cual desea la proyección.
+*   **Semestre**: (Si aplica) Temporada de siembra.
+*   **Datos Climáticos y de Suelo**: El sistema intentará cargar valores promedio históricos para el municipio. Puede ajustarlos si tiene datos más precisos de su parcela (Temperatura, Precipitación, pH, etc.).
+
+Al finalizar, haga clic en el botón **"Analizar / Calcular"**.
+
+### Paso 3: Resultados y Recomendaciones
+La aplicación procesará los datos (todo ocurre en su navegador, no se envían datos a servidores externos) y le mostrará:
+
+1.  **Gráfica de Proyección**: Una visualización de la producción estimada a lo largo del tiempo para el cultivo seleccionado.
+2.  **Recomendaciones**: Una lista de otros cultivos que históricamente han tenido buen rendimiento en ese municipio o en municipios con condiciones similares (Clusters).
+3.  **Detalles del Cultivo**: Información clave como el ciclo de vida del cultivo (días), y comparativas de las condiciones de su municipio vs. los requerimientos ideales.
+
+### Paso 4: Nueva Consulta
+Si desea realizar otro análisis, busque el botón o enlace **"Volver"** o **"Ingresar nuevos datos"** al final de la página de resultados.
+
+---
+
+## 6. Solución de Problemas Comunes
+
+*   **Error "command not found: npm"**: Asegúrese de haber instalado Node.js correctamente. Cierre y vuelva a abrir su terminal.
+*   **La página no carga en localhost:3000**: Verifique que no haya otro programa usando el puerto 3000. Si es así, Next.js usualmente intentará usar el 3001 (mire la salida en la terminal).
+*   **Los gráficos no aparecen**: Asegúrese de tener una conexión a internet estable la primera vez para cargar las librerías de gráficos, o verifique que no tenga bloqueadores de scripts agresivos en su navegador.
